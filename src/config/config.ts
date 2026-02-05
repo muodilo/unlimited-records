@@ -1,12 +1,16 @@
 import dotenv from 'dotenv';
 import path from 'path'
+import { fileURLToPath } from 'url'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
 
 dotenv.config({path: path.join(__dirname,'../../.env')});
 
 export const config = {
     port: process.env.PORT || 3000,
     mongodb: {
-        uri: process.env.MONGODB_URI
+        uri: process.env.MONGO_URI || process.env.MONGODB_URI
     },
     jwt:{
         secret: process.env.JWT_SECRET,
@@ -17,7 +21,7 @@ export const config = {
     },
     email:{
         host:process.env.EMAIL_HOST,
-        port:parseInt(process.env.EMAI_PORT || '587',10),
+        port:parseInt(process.env.EMAIL_PORT || '587',10),
         user:process.env.EMAIL_USER,
         pass:process.env.EMAIL_PASS,
     },
