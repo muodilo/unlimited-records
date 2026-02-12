@@ -3,10 +3,10 @@ import type { IUser } from '../types/user.types.js';
 
 const userSchema = new Schema<IUser>(
   {
-    name: { 
-      type: String, 
-      required: true, 
-      trim: true 
+    name: {
+      type: String,
+      required: true,
+      trim: true,
     },
     email: {
       type: String,
@@ -14,23 +14,35 @@ const userSchema = new Schema<IUser>(
       unique: true,
       trim: true,
       lowercase: true,
-      index: true 
+      index: true,
     },
-    password: { 
-      type: String, 
-      required: true 
+    password: {
+      type: String,
+      required: true,
     },
     resetPasswordToken: String,
     resetPasswordExpires: Date,
     isVerified: {
-        type: Boolean,
-        default: false,
-      },
-      verificationToken: String,
-      verificationTokenExpires: Date,
+      type: Boolean,
+      default: false,
     },
-  { 
-    timestamps: true 
+    verificationToken: String,
+    verificationTokenExpires: Date,
+    // Security/session‑management fields
+    failedLoginAttempts: {
+      type: Number,
+      default: 0,
+    },
+    lockUntil: Date,
+    refreshTokenHash: String,
+    refreshTokenExpires: Date,
+    tokenVersion: {
+      type: Number,
+      default: 0,
+    },
+  },
+  {
+    timestamps: true,
   }
 );
 

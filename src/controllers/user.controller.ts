@@ -1,12 +1,13 @@
 import type { Request, Response } from "express";
 import { User } from "../models/user.models.js";
 import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
 import { config } from "../config/config.js";
 import type { IUserInput } from "../types/user.types.js";
 import { createCustomError } from "../utils/error.js";
 import { EmailService } from "../services/email.service.js";
 import crypto from "crypto";
+import { AuthService } from "../services/auth.service.js";
+import type { AuthRequest } from "../middleware/auth.js";
 
 export class UserController {
   // User signup method
@@ -40,11 +41,11 @@ export class UserController {
 
       // Create new user
       const user = await User.create({
-      name,
-      email,
-      password: hashedPassword,
-      verificationToken,
-      verificationTokenExpires: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 hours
+        name,
+        email,
+        password: hashedPassword,
+        verificationToken,
+        verificationTokenExpires: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 hours
       });
 
       try {
@@ -87,56 +88,76 @@ export class UserController {
     // Find user by email
     const user = await User.findOne({ email });
     if (!user) {
-    res.status(401).json({
-      status: "error",
-      message: "Invalid credentials",
-    });
-    return;
+      res.status(401).json({
+        status: "error",
+        message: "Invalid credentials",
+      });
+      return;
+    }
+
+    // Account lockout check to slow down brute‑force attempts
+    if (user.lockUntil && user.lockUntil > new Date()) {
+      res.status(423).json({
+        status: "error",
+        message: "Account temporarily locked. Please try again later.",
+      });
+      return;
     }
 
     // Check if user is verified
     if (user.isVerified != true) {
-    res.status(401).json({
-      status: "error",
-      message: "Verify Email",
-    });
-    return;
+      res.status(401).json({
+        status: "error",
+        message: "Verify Email",
+      });
+      return;
     }
 
     // Validate password
     const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) {
-    res.status(401).json({
-      status: "error",
-      message: "Invalid credentials",
-    });
-    return;
-    }
+      const failed = (user.failedLoginAttempts ?? 0) + 1;
+      user.failedLoginAttempts = failed;
 
-    // Generate JWT token
-    if (!config.jwt.secret) {
-      console.error("JWT secret is not configured");
-      res.status(500).json({ status: "error", message: "Authentication configuration error" });
+      if (failed >= config.auth.maxFailedLoginAttempts) {
+        user.lockUntil = new Date(Date.now() + config.auth.accountLockMs);
+      }
+
+      await user.save();
+
+      res.status(401).json({
+        status: "error",
+        message: "Invalid credentials",
+      });
       return;
     }
-    const jwtSecret: jwt.Secret = config.jwt.secret as jwt.Secret;
-    const jwtExpiresIn: jwt.SignOptions['expiresIn'] = (config.jwt.expiresIn as jwt.SignOptions['expiresIn']) ?? '1h';
-    const token = jwt.sign(
-      { userId: user._id },
-      jwtSecret,
-      { expiresIn: jwtExpiresIn }
-    );
+
+    // Successful login: reset lockout counters
+    user.failedLoginAttempts = 0;
+    // Remove lockUntil so it isn't present (avoids assigning undefined to a Date-typed property)
+    delete (user as any).lockUntil;
+
+    // Issue new access and refresh tokens
+    const tokenVersion = user.tokenVersion ?? 0;
+    const accessToken = AuthService.generateAccessToken(user._id.toString(), tokenVersion);
+    const refreshToken = AuthService.generateRefreshToken();
+    const refreshTokenHash = AuthService.hashToken(refreshToken);
+
+    user.refreshTokenHash = refreshTokenHash;
+    user.refreshTokenExpires = new Date(Date.now() + config.jwt.refreshTokenTtlMs);
+    await user.save();
+
+    AuthService.setAuthCookies(res, accessToken, refreshToken);
 
     res.json({
-    status: "success",
-    data: {
-      token,
-      user: {
-      id: user._id,
-      name: user.name,
-      email: user.email,
+      status: "success",
+      data: {
+        user: {
+          id: user._id,
+          name: user.name,
+          email: user.email,
+        },
       },
-    },
     });
   } catch (error) {
     res.status(500).json({
@@ -301,5 +322,133 @@ export class UserController {
     message: "Internal server error",
     });
   }
+  }
+
+  /**
+   * Refresh access/refresh tokens using the refresh token stored in an
+   * HTTP‑only cookie. Implements refresh‑token rotation by invalidating
+   * the old token on every successful refresh.
+   */
+  static async refreshToken(req: Request, res: Response): Promise<void> {
+    try {
+      const incomingToken = req.cookies?.refreshToken;
+
+      if (!incomingToken) {
+        res.status(401).json({ status: 'error', message: 'Refresh token missing' });
+        return;
+      }
+
+      const hashed = AuthService.hashToken(incomingToken);
+      const user = await User.findOne({ refreshTokenHash: hashed });
+
+      if (!user || !user.refreshTokenExpires || user.refreshTokenExpires <= new Date()) {
+        // Always clear cookies on suspicious/expired refresh attempts.
+        AuthService.clearAuthCookies(res);
+        res.status(401).json({ status: 'error', message: 'Invalid or expired refresh token' });
+        return;
+      }
+
+      const tokenVersion = user.tokenVersion ?? 0;
+      const newAccessToken = AuthService.generateAccessToken(user._id.toString(), tokenVersion);
+      const newRefreshToken = AuthService.generateRefreshToken();
+      const newRefreshHash = AuthService.hashToken(newRefreshToken);
+
+      // Rotate refresh token: replace the stored hash/expiry.
+      user.refreshTokenHash = newRefreshHash;
+      user.refreshTokenExpires = new Date(Date.now() + config.jwt.refreshTokenTtlMs);
+      await user.save();
+
+      AuthService.setAuthCookies(res, newAccessToken, newRefreshToken);
+
+      res.json({
+        status: 'success',
+        data: {
+          user: {
+            id: user._id,
+            name: user.name,
+            email: user.email,
+          },
+        },
+      });
+    } catch (error) {
+      console.error('Refresh token error:', error);
+      AuthService.clearAuthCookies(res);
+      res.status(500).json({
+        status: 'error',
+        message: 'Internal server error',
+      });
+    }
+  }
+
+  /**
+   * Logout from the current device by invalidating the stored refresh
+   * token hash and clearing auth cookies.
+   */
+  static async logout(req: Request, res: Response): Promise<void> {
+    try {
+      const incomingToken = req.cookies?.refreshToken;
+      if (incomingToken) {
+        const hashed = AuthService.hashToken(incomingToken);
+        await User.updateOne(
+          { refreshTokenHash: hashed },
+          {
+            $unset: {
+              refreshTokenHash: 1,
+              refreshTokenExpires: 1,
+            },
+          }
+        );
+      }
+
+      AuthService.clearAuthCookies(res);
+      res.status(200).json({ status: 'success', message: 'Logged out' });
+    } catch (error) {
+      console.error('Logout error:', error);
+      AuthService.clearAuthCookies(res);
+      res.status(500).json({
+        status: 'error',
+        message: 'Internal server error',
+      });
+    }
+  }
+
+  /**
+   * Logout from all devices by incrementing tokenVersion and clearing
+   * the stored refresh token. All existing access tokens become invalid
+   * because their tokenVersion no longer matches the database value.
+   */
+  static async logoutAll(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      if (!req.userId) {
+        res.status(401).json({ status: 'error', message: 'Authentication required' });
+        return;
+      }
+
+      const user = await User.findById(req.userId);
+      if (!user) {
+        res.status(404).json({ status: 'error', message: 'User not found' });
+        return;
+      }
+
+      user.tokenVersion = (user.tokenVersion ?? 0) + 1;
+      // Unset refresh token fields instead of assigning `undefined` to string-typed properties
+      delete (user as any).refreshTokenHash;
+      delete (user as any).refreshTokenExpires;
+      await user.save();
+
+      AuthService.clearAuthCookies(res);
+
+      res.status(200).json({
+        status: 'success',
+        message: 'Logged out from all devices',
+      });
+    } catch (error) {
+      console.error('Logout-all error:', error);
+      AuthService.clearAuthCookies(res);
+      res.status(500).json({
+        status: 'error',
+        message: 'Internal server error',
+      });
+    }
   }
 }

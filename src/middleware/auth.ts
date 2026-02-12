@@ -1,41 +1,36 @@
 import type { Request, Response, NextFunction } from 'express';
-import jwt from 'jsonwebtoken';
-import { config } from '../config/config.js';
+import { AuthService } from '../services/auth.service.js';
 
 export interface AuthRequest extends Request {
   userId?: string;
 }
 
 /**
- * Middleware to authenticate a JWT token from the request headers.
+ * Middleware to authenticate users via the access token stored in an
+ * HTTP‑only cookie (`accessToken`).
  *
- * @param req - The request object, extended to include `userId` if authentication is successful.
- * @param res - The response object.
- * @param next - The next middleware function in the stack.
- *
- * @returns A response with status 401 if no token is provided, or status 403 if the token is invalid or expired.
- *
- * @remarks
- * This middleware expects the JWT token to be provided in the `Authorization` header in the format `Bearer <token>`.
- * If the token is valid, the `userId` from the token payload is attached to the request object.
+ * This avoids sending tokens in headers or localStorage, which are more
+ * susceptible to XSS. We also validate the embedded tokenVersion against
+ * the database so that logout‑all invalidates older tokens.
  */
-export const authenticateToken = (
+export const authenticateToken = async (
   req: AuthRequest,
   res: Response,
   next: NextFunction
-) => {
-  const authHeader = req.headers.authorization;
-  const token = authHeader?.split(' ')[1];
+): Promise<void> => {
+  const token = req.cookies?.accessToken;
 
   if (!token) {
-    return res.status(401).json({ message: 'Authentication token required' });
+    res.status(401).json({ message: 'Authentication required' });
+    return;
   }
 
-  try {
-    const decoded = jwt.verify(token, config?.jwt?.secret!) as { userId: string };
-    req.userId = decoded.userId;
-    next();
-  } catch (error) {
-    return res.status(403).json({ message: 'Invalid or expired token' });
+  const payload = await AuthService.validateAccessToken(token);
+  if (!payload) {
+    res.status(401).json({ message: 'Invalid or expired token' });
+    return;
   }
+
+  req.userId = payload.userId;
+  next();
 };
